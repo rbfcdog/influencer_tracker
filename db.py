@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import json
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -219,3 +221,28 @@ class PostgresDB:
                     error_message,
                 ),
             )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="PostgreSQL helper for influencer tracker")
+    parser.add_argument(
+        "--database-url",
+        default=None,
+        help="PostgreSQL DSN. If omitted, uses DATABASE_URL env var.",
+    )
+    return parser
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
+    database_url = args.database_url or os.getenv("DATABASE_URL")
+    if not database_url:
+        raise ValueError("DATABASE_URL is required (or pass --database-url)")
+
+    with PostgresDB(database_url) as db:
+        db.initialize_schema()
+    print("Database connection OK. Schema initialized.")
+
+
+if __name__ == "__main__":
+    main()

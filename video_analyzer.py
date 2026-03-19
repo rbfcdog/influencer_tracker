@@ -6,6 +6,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Callable, TypeVar
+from dotenv import load_dotenv
 
 from analyzer import GeminiVideoAnalyzer, VIRALITY_PROMPT
 from db import PostgresDB
@@ -13,6 +14,8 @@ from downloader import VideoDownloader
 from scraper import TikTokScraper
 
 T = TypeVar("T")
+
+load_dotenv()
 
 
 def _retry(operation_name: str, func: Callable[[], T], retries: int, delay_seconds: float) -> T:
@@ -43,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="TikTok → download → Gemini virality analysis → PostgreSQL")
 	parser.add_argument("--username", required=True, help="TikTok username to fetch recent videos from")
 	parser.add_argument("--count", type=int, default=20, help="Number of recent videos to process")
+	parser.add_argument("--download-only", action="store_true", help="Only download videos (skip DB and Gemini analysis)")
+	parser.add_argument("--database-url", default=None, help="PostgreSQL DSN (overrides DATABASE_URL env var)")
 	parser.add_argument("--download-dir", default="downloads", help="Folder for full downloaded mp4 files")
 	parser.add_argument("--clip-dir", default="clips", help="Folder for first-N-second clips")
 	parser.add_argument("--raw-dir", default="raw_gemini", help="Folder for raw Gemini responses")
@@ -60,9 +65,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
 	if args.clip_seconds <= 0:
 		raise ValueError("--clip-seconds must be greater than 0")
 
-	database_url = os.getenv("DATABASE_URL")
-	if not database_url:
-		raise ValueError("DATABASE_URL environment variable is required")
+	database_url = args.database_url or os.getenv("DATABASE_URL")
+	if not args.download_only and not database_url:
+		raise ValueError("DATABASE_URL environment variable is required (or pass --database-url), unless using --download-only")
 
 	scraper = TikTokScraper(
 		ms_token=os.getenv("ms_token"),
@@ -73,11 +78,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
 		clip_dir=args.clip_dir,
 		clip_seconds=args.clip_seconds,
 	)
-	analyzer = GeminiVideoAnalyzer(
-		api_key=os.getenv("GEMINI_API_KEY"),
-		model_name=args.model,
-		prompt=VIRALITY_PROMPT,
-	)
+	analyzer = None
+	if not args.download_only:
+		analyzer = GeminiVideoAnalyzer(
+			api_key=os.getenv("GEMINI_API_KEY"),
+			model_name=args.model,
+			prompt=VIRALITY_PROMPT,
+		)
 
 	print(f"Fetching up to {args.count} recent videos for @{args.username}...")
 	videos = _retry(
@@ -88,7 +95,26 @@ def run_pipeline(args: argparse.Namespace) -> None:
 	)
 	print(f"Fetched: {len(videos)} videos")
 
+	if args.download_only:
+		for index, video in enumerate(videos, start=1):
+			video_id = str(video.get("id", "unknown"))
+			print(f"[{index}/{len(videos)}] Downloading video {video_id}")
+
+			downloaded_path = _retry(
+				operation_name=f"download_video:{video_id}",
+				func=lambda: downloader.download_video(video_payload=video, username=args.username),
+				retries=args.retry_count,
+				delay_seconds=args.retry_delay,
+			)
+			print(f"Saved: {downloaded_path}")
+			time.sleep(args.sleep_seconds)
+
+		return
+
 	raw_dir = Path(args.raw_dir)
+
+	if database_url is None:
+		raise RuntimeError("database_url must be set when not in --download-only mode")
 
 	with PostgresDB(database_url) as db:
 		db.initialize_schema()
